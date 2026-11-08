@@ -67,6 +67,7 @@ with open(caddyfile, "w") as f:
 # setup.py gets the stub Caddy with --caddy, so a Caddy installed on this machine never changes the questions
 answers = [
     "example.org", "", "",                      # domain, CDN host (default cdn.example.org), files folder (default)
+    "y",                                        # publish the statistics page (stats.example.org)
     caddyfile, "y",                             # Caddyfile, LAN dashboard: yes
     "n",                                        # no tunnel
     "", "", "", "",                             # no Cloudflare token, default sender, no SMTP server, no Resend key
@@ -112,8 +113,14 @@ try:
     out = r.stdout + r.stderr
     check("setup.py exits cleanly", r.returncode == 0, out[-1500:])
     cfg = config(home)
-    check("site written", cfg["instance"]["name"] == "example.org" and cfg["public"]["hosts"] == ["cdn.example.org", "example.org"]
-          and cfg["public_base_url"] == "https://cdn.example.org", cfg.get("instance"))
+    check("site written", cfg["instance"]["name"] == "example.org"
+          and cfg["public"]["hosts"] == ["cdn.example.org", "example.org", "stats.example.org"]
+          and cfg["public_base_url"] == "https://cdn.example.org", (cfg.get("instance"), cfg.get("public")))
+    tele_conf = os.path.join(home, "telemetry", "telemetry.json")
+    tele = json.load(open(tele_conf)) if os.path.exists(tele_conf) else {}
+    check("statistics page port written, offset like the others",
+          tele.get("listen") == "127.0.0.1:%d" % (int(cfg["listen"].rsplit(":", 1)[1]) - 8), tele)
+    check("no-service run says how to start the statistics page", "telemetry.py" in out, out[-800:])
     check("caddy paths written", cfg["caddy_exe"] == caddy and cfg["caddyfile"] == caddyfile, (cfg.get("caddy_exe"), cfg.get("caddyfile")))
     check("owner written", cfg["auth"]["user"] == "owner" and cfg["auth"]["password_hash"].startswith("pbkdf2_sha256$")
           and cfg["alerts"]["to"] == ["owner@example.org"], cfg.get("auth", {}).get("user"))
@@ -132,16 +139,17 @@ try:
     # a stray answer for the Caddyfile (a relative "n") must not create a file in the code folder
     stray = os.path.join(ra.CODE, "n")
     had = os.path.exists(stray)
-    r3 = install(["example.com", "", "", "n", "n", "n"], os.path.join(root, "home3"))
+    r3 = install(["example.com", "", "", "n", "n", "n", "n"], os.path.join(root, "home3"))
     check("a new Caddyfile in the code folder is refused", r3.returncode != 0 and (had or not os.path.exists(stray))
           and "Corium's code folder" in r3.stdout, (r3.returncode, r3.stdout[-600:]))
 
     # second run: Enter everywhere keeps what is there
-    r2 = install(["", "", "", "", "n", "", "", "", "", "y"])
+    r2 = install(["", "", "", "", "", "n", "", "", "", "", "y"])
     cfg2 = config(home)
     check("re-run exits cleanly", r2.returncode == 0, (r2.stdout + r2.stderr)[-1500:])
     check("re-run keeps owner, ports and site", cfg2["auth"] == cfg["auth"] and cfg2["listen"] == cfg["listen"]
-          and cfg2["instance"] == cfg["instance"], (cfg2.get("listen"), cfg2.get("instance")))
+          and cfg2["instance"] == cfg["instance"] and cfg2["public"] == cfg["public"],
+          (cfg2.get("listen"), cfg2.get("instance"), cfg2.get("public")))
     check("re-run doesn't add the import twice", open(caddyfile).read().count(imp) == 1)
     check("strata.json backed up on re-run", any(n.startswith("strata.json.") for n in os.listdir(os.path.join(home, "backups"))))
 
@@ -150,7 +158,7 @@ try:
     os.makedirs(os.path.dirname(caddyfile2))
     with open(caddyfile2, "w") as f:
         f.write("{\n\tadmin localhost:2019\n}\n")
-    code, out, key = install_with_app(["example.net", "", "", caddyfile2, "n", "n", "", "", "", "",
+    code, out, key = install_with_app(["example.net", "", "", "", caddyfile2, "n", "n", "", "", "", "",
                                        "owner2", "another long passphrase", "another long passphrase", ""], home2)
     check("app setup exits cleanly", code == 0 and key, out[-1500:])
     cfg3 = config(home2)
@@ -158,6 +166,8 @@ try:
     check("the app's key is stored with recovery codes", a3.get("totp_secret") == key and len(a3.get("recovery") or []) == 10
           and a3.get("totp_last"), {k: v for k, v in a3.items() if k != "password_hash"})
     check("no e-mail asked for or stored", "to" not in cfg3.get("alerts", {}), cfg3.get("alerts"))
+    check("statistics page off by default", cfg3["public"]["hosts"] == ["cdn.example.net", "example.net"]
+          and "telemetry.py" not in out, cfg3.get("public"))
     import re
     check("the ten recovery codes are shown", len(set(re.findall(r"\b[0-9a-f]{6}-[0-9a-f]{6}\b", out))) == 10, out[-800:])
 

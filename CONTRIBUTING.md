@@ -2,7 +2,7 @@
 
 Thanks for wanting to help. Corium is a small, one-person project, so short and focused pull requests are the easiest to review and merge.
 
-## Try it first
+## Try It First:
 
 You don't need Caddy, cloudflared or a Cloudflare account to work on Corium. The demo instance runs the full dashboard with a week of made-up traffic:
 
@@ -15,7 +15,7 @@ python tests/demo.py
 
 Then open [http://127.0.0.1:8290](http://127.0.0.1:8290). You're signed in as the demo user `alex`. Everything lives in a temp folder and uses IP ranges reserved for documentation, so nothing touches your system or a real visitor.
 
-## Before you open a pull request
+## Before You Open a Pull Request:
 
 Run the test suite:
 
@@ -27,7 +27,7 @@ It builds a throwaway instance with a stub Caddy and needs port 8190 free. Add `
 
 If you change something you can see in the dashboard, add a screenshot from the demo instance.
 
-## How the code is written
+## How the Code Is Written:
 
 - **Plain Python, no framework.** Standard library first. The only dependencies are the four in `requirements.txt`; please ask in an issue before adding one.
 - **Vanilla JavaScript, no build step.** The dashboard in `static/` is loaded as-is by the browser.
@@ -38,21 +38,22 @@ If you change something you can see in the dashboard, add a screenshot from the 
 
 [`README.md`](README.md#code-layout) has a map of which file does what.
 
-## Windows first, Linux welcome
+## Windows First, Linux Welcome:
 
-Corium is built and used on Windows. The Linux paths (systemd install, file handling) pass the tests but have never run on a real machine. If you run Linux, a report of what works and what breaks is one of the most useful things you can contribute, even without a fix.
+Corium is built and used on Windows. The Linux paths (systemd install, file handling) pass the full test suite but haven't run on a production machine yet; the README says the same. If you run Linux, a report of what works and what breaks is one of the most useful things you can contribute, even without a fix. An issue works, and so does a message on [Discord](https://discord.gg/jRn5kbv2HX).
 
-## Where to start
+## Where to Start:
 
 - Issues labelled [**good first issue**](https://github.com/Sanedish/corium/labels/good%20first%20issue) are small and self-contained.
 - [Issues](https://github.com/Sanedish/corium/issues) lists what's planned and what's still open.
 - For anything bigger than a bug fix, open an issue first so we can agree on the approach before you spend time on it.
+- Not sure what to pick, or want to talk an idea through first? Ask on the [Corium Discord](https://discord.gg/jRn5kbv2HX).
 
-## Security issues
+## Security Issues:
 
 Please don't open a public issue for a vulnerability. Report it privately as described in [`SECURITY.md`](SECURITY.md).
 
-## Forks and the name "Corium"
+## Forks and the Name "Corium":
 
 Change your own copy however you like, including the whole interface. That's what the MIT License is for.
 
@@ -65,6 +66,6 @@ If you publish a modified version under the name **Corium**, keep the basic desi
 
 A version that drops this for a generic, animated "AI dashboard" look is a different project: please give it a different name. You're still welcome to say it's "based on Corium" and link back here.
 
-## License
+## License:
 
 By contributing, you agree that your contribution is licensed under the [MIT License](LICENSE), like the rest of Corium.

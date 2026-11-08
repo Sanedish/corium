@@ -50,7 +50,7 @@ import urllib.request
 
 import instance
 
-VERSION = "0.5.0"                   # bump on every release; the dashboard compares it with the latest GitHub release
+VERSION = "0.5.1"                   # bump on every release; the dashboard compares it with the latest GitHub release
 ROOT = instance.CODE                     # shared code: static/, gallery/, media/*.py, vendor/
 HOME = instance.HOME                     # this site's instance home: strata.json, data/, generated/ (see instance.py)
 CONFIG_PATH = os.path.join(HOME, "strata.json")
@@ -123,6 +123,13 @@ DEFAULTS = {
     "sign_secret": "",                   # HMAC key for signed links; generated on first start
     "upload": {"chunk_mb": 32, "max_chunk_mb": 95, "parallel": 3, "stale_hours": 48},
     "versions_keep": 10,
+    # Usage statistics (usage.py, docs/USAGE-STATISTICS.md): anonymous aggregate numbers, once a day, ONLY after the
+    # owner said yes (setup.py or Settings > System). DO_NOT_TRACK=1 / CORIUM_NO_USAGE=1 override it.
+    "usage": {"enabled": False,
+              "asked": False,                # the owner has answered the question (yes or no): don't ask again
+              "endpoint": "",                # "" = usage.DEFAULT_ENDPOINT; https only
+              "id": "",                      # random, made on opt-in; forgotten on "switch off and delete"
+              "key": ""},                    # random deletion key (data/.env); the collector keeps only its hash
     "gone_days": 30,                     # permanently deleted paths keep answering 404 + Clear-Site-Data this long
     # Smart-Sorting (static/storage.js): uploads at a drive root go to the user's home, sorted into type folders;
     # with the Files toggle on, uploads into any other folder get <folder>/css, /js and /<assets>/<type>/.

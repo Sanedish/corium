@@ -8,9 +8,11 @@
     python setup.py --caddy <exe>   use this Caddy instead of looking for one (scripted installs, tests)
     python setup.py --uninstall     remove the service (configuration and data stay)
 
-Steps: Python packages into vendor/, the site (domain, files folder, ports), Caddy (Caddyfile backup + import of the
-config Corium renders), the Cloudflare Tunnel (config backup + ingress rule for the CDN host), API keys and the owner
-account, strata.json (backup first) and data/.env (every secret), then the service: a Task Scheduler task on Windows, a systemd unit on Linux.
+Steps: Python packages into vendor/, the site (domain, files folder, optional public statistics page, ports), Caddy
+(Caddyfile backup + import of the config Corium renders), the Cloudflare Tunnel (config backup + ingress rules for the
+CDN host and the stats host), API keys and the owner account, strata.json (backup first) and data/.env (every secret),
+then the services: a Task Scheduler task on Windows, a systemd unit on Linux, for Corium and, when the statistics page
+is on, for Corium Telemetry (telemetry/telemetry.py).
 Standard library only, so it runs before anything is installed.
 """
 import argparse
@@ -19,6 +21,7 @@ import glob
 import json
 import os
 import re
+import secrets
 import shutil
 import socket
 import subprocess
@@ -32,8 +35,8 @@ from xml.sax.saxutils import escape
 CODE = os.path.dirname(os.path.abspath(__file__))
 WIN = os.name == "nt"
 STAMP = time.strftime("%Y%m%d-%H%M%S")
-BASE_PORTS = {"listen": 8090, "feed_listen": 8081, "transform_listen": 8083, "gate_listen": 8085, "media": 8084,
-              "cdn": 8080, "lan": 8091}
+BASE_PORTS = {"listen": 8090, "feed_listen": 8081, "telemetry": 8082, "transform_listen": 8083, "gate_listen": 8085,
+              "media": 8084, "cdn": 8080, "lan": 8091}
 CF_PERMISSIONS = ["Zone > Zone > Read", "Zone > DNS > Edit", "Zone > Cache Purge > Purge",
                   "Zone > Zone Settings > Edit", "Zone > Zone WAF > Edit", "Zone > Cache Rules > Edit",
                   "Account > Account Filter Lists > Edit"]
@@ -238,12 +241,29 @@ def service_exists(name):
 
 
 def service_names(home, iid):
-    """(Corium service, tunnel service) names: plain for the instance in the code folder, suffixed for the others.
-    They keep the old name: installs find, restart and remove their tasks by it (docs/RENAMING.md)."""
+    """(Corium service, tunnel service, statistics page service) names: plain for the instance in the code folder,
+    suffixed for the others. They keep the old name: installs find, restart and remove their tasks by it
+    (docs/RENAMING.md; telemetry/site/deploy.ps1 restarts "Strata Telemetry")."""
     default = os.path.normcase(home) == os.path.normcase(CODE) or not iid
     if WIN:
-        return "Strata" if default else "Strata %s" % iid, "Strata Tunnel" if default else "Strata Tunnel %s" % iid
-    return "strata" if default else "strata-%s" % iid, "strata-tunnel" if default else "strata-tunnel-%s" % iid
+        return tuple(n if default else "%s %s" % (n, iid) for n in ("Strata", "Strata Tunnel", "Strata Telemetry"))
+    return tuple(n if default else "%s-%s" % (n, iid) for n in ("strata", "strata-tunnel", "strata-telemetry"))
+
+
+def remove_service(name):
+    """Stop and remove a task / unit registered by install_task / install_unit. Returns (code, output)."""
+    if WIN:
+        run(["schtasks", "/End", "/TN", name])
+        return run(["schtasks", "/Delete", "/TN", name, "/F"])
+    run(["systemctl", "disable", "--now", name])
+    unit = "/etc/systemd/system/%s.service" % name
+    code, out = run(["rm", unit]) if os.path.exists(unit) else (0, "")
+    run(["systemctl", "daemon-reload"])
+    return code, out
+
+
+def service_registered(name):
+    return task_exists(name) if WIN else service_exists(name)
 
 
 # ---------------------------------------------------------------- steps
@@ -308,20 +328,57 @@ def step_site(cfg, raw, home):
     files = (raw.get("storage_paths") or [""])[0] or os.path.join(home, "files")
     files = os.path.abspath(ask("Folder with the files to serve", files))
     os.makedirs(files, exist_ok=True)
-    cfg["site"] = {"domain": domain, "cdn": cdn, "files": files}
+    stats = step_stats_host(domain, cdn, hosts)
+    # the CDN host first (rules.py serves the first storage path on it), then the domain and the stats host; hosts
+    # added by hand are kept, the previous CDN host, domain and stats host are replaced by the answers above
+    old = {hosts[0] if hosts else "", inst.get("name") or ""}
+    new_hosts = []
+    for h in [cdn, domain, stats] + [h for h in hosts if h not in old and not h.startswith("stats.")]:
+        if h and h not in new_hosts:
+            new_hosts.append(h)
+    cfg["site"] = {"domain": domain, "cdn": cdn, "files": files, "stats": stats}
     merge(cfg["update"], {
         "instance": {"id": iid, "name": domain, "prefix": inst.get("prefix") or ("strata" if default_home else iid + "_strata")},
-        "public": {"hosts": [cdn] if cdn == domain else [cdn, domain]},
+        "public": {"hosts": new_hosts},
         "public_base_url": "https://" + cdn,
         "storage_paths": [files] + [p for p in raw.get("storage_paths") or [] if p != files],
     })
 
 
-def ports_for(raw, caddyfile_text):
+def step_stats_host(domain, cdn, hosts):
+    """Ask whether to publish the public statistics page (Corium Telemetry). Returns its hostname, or "".
+    It has to start with "stats.": that is how Corium recognises it (rules.stats_host)."""
+    old = next((h for h in hosts if h.startswith("stats.")), "")
+    host = old if old.endswith("." + domain) else "stats." + domain
+    say("  Corium can publish a public statistics page for this site at %s: requests, traffic and cache totals," % host)
+    say("  never addresses, file names, paths or accounts. It runs as its own small service (Corium Telemetry).")
+    if not yes("Publish the public statistics page?", bool(old)):
+        return ""
+    if host == cdn:
+        say("  %s is the CDN host, so it can't also be the statistics page. Skipped." % host)
+        return ""
+    return host
+
+
+def telemetry_conf_path(home):
+    return os.path.join(home, "telemetry", "telemetry.json")
+
+
+def telemetry_listen(home):
+    """The address Corium Telemetry listens on, from <home>/telemetry/telemetry.json ("" when not set up yet)."""
+    try:
+        with open(telemetry_conf_path(home), encoding="utf-8-sig") as f:
+            return str(json.load(f).get("listen") or "")
+    except (OSError, ValueError, AttributeError):
+        return ""
+
+
+def ports_for(raw, caddyfile_text, home=CODE):
     if raw.get("listen"):  # already set up: keep what the running instance uses
         p = lambda v, d: int(str(v or d).rsplit(":", 1)[-1])
         listen = p(raw.get("listen"), 8090)
         return {"listen": listen, "feed_listen": p(raw.get("feed_listen"), 8081),
+                "telemetry": p(telemetry_listen(home), listen - 8),
                 "transform_listen": p(raw.get("transform_listen"), 8083), "gate_listen": p(raw.get("gate_listen"), 8085),
                 "media": p((raw.get("media") or {}).get("listen"), 8084),
                 "cdn": p((raw.get("instance") or {}).get("cdn_listen"), 8080), "lan": listen + 1}
@@ -354,7 +411,7 @@ def step_caddy(cfg, raw, home, given=""):
     else:
         sys.exit("  No usable Caddyfile path given.")
     text = open(caddyfile, encoding="utf-8-sig").read() if os.path.exists(caddyfile) else ""
-    ports = ports_for(raw, text)
+    ports = ports_for(raw, text, home)
     cfg["ports"] = ports
     gen = os.path.join(home, "generated", "cdn.caddy")
     import_line = "import " + gen.replace("\\", "/")  # the exact line rules.py looks for
@@ -448,17 +505,22 @@ def step_tunnel(cfg, raw, service):
             say("  skipped. Install cloudflared and run setup again to connect the tunnel.")
             return
     say("  found %s (%s)" % (exe, run([exe, "--version"])[1].split("\n")[0][:60]))
-    host, port = cfg["site"]["cdn"], cfg["ports"]["cdn"]
+    # the stats host goes to the same Caddy site as the CDN: its "Public statistics" drive proxies to Corium Telemetry
+    hosts, port = [h for h in (cfg["site"]["cdn"], cfg["site"].get("stats")) if h], cfg["ports"]["cdn"]
+    rules_text = lambda ind: "".join("%s- hostname: %s\n%s  service: http://localhost:%d\n" % (ind, h, ind, port)
+                                     for h in hosts)
     path = find_cloudflared_config(raw)
     tunnel = ""
     if path:
         say("  tunnel config: %s" % path)
         text = open(path, encoding="utf-8-sig").read()
         tunnel = (re.search(r"(?m)^tunnel:\s*['\"]?([^'\"\s]+)", text) or [None, ""])[1]
-        new = add_ingress(text, host, port)
+        new = text
+        for h in hosts:
+            new = add_ingress(new, h, port) if new is not None else None
         if new is None:
-            say("  couldn't find the ingress catch-all rule. Add this rule to the ingress list by hand:\n"
-                "    - hostname: %s\n      service: http://localhost:%d" % (host, port))
+            say("  couldn't find the ingress catch-all rule. Add these rules to the ingress list by hand:\n"
+                + rules_text("    "))
         elif new != text:
             say("  backup: %s" % backup(path))
             write(path, new)
@@ -467,9 +529,9 @@ def step_tunnel(cfg, raw, service):
                 write(path, text)
                 say("  cloudflared rejected the change, restored the old config: " + out[-300:])
             else:
-                say("  added %s -> localhost:%d" % (host, port))
+                say("  added %s -> localhost:%d" % (", ".join(h for h in hosts if h not in text), port))
         else:
-            say("  %s is already routed" % host)
+            say("  %s already routed" % " and ".join(hosts))
     elif yes("No tunnel config found. Create a tunnel now? (opens a browser to sign in to Cloudflare)"):
         cert = os.path.expanduser("~/.cloudflared/cert.pem")
         if not os.path.exists(cert):
@@ -483,14 +545,15 @@ def step_tunnel(cfg, raw, service):
             return
         tunnel = m.group(1)
         path = os.path.expanduser("~/.cloudflared/config.yml")
-        write(path, "tunnel: %s\ncredentials-file: %s\n\ningress:\n  - hostname: %s\n    service: http://localhost:%d\n"
-                    "  - service: http_status:404\n" % (tunnel, creds.group(1).strip(), host, port))
+        write(path, "tunnel: %s\ncredentials-file: %s\n\ningress:\n%s  - service: http_status:404\n"
+              % (tunnel, creds.group(1).strip(), rules_text("  ")))
         say("  created tunnel %s, config %s" % (name, path))
     else:
         return
-    if tunnel and yes("Point the DNS record for %s at this tunnel?" % host):
-        code, out = run([exe, "tunnel", "--config", path, "route", "dns", tunnel, host])
-        say("  " + (out.splitlines()[-1] if out else "done") if code == 0 else "  route dns failed: " + out[-300:])
+    if tunnel and yes("Point the DNS record%s for %s at this tunnel?" % ("s" if len(hosts) > 1 else "", " and ".join(hosts))):
+        for h in hosts:
+            code, out = run([exe, "tunnel", "--config", path, "route", "dns", tunnel, h])
+            say("  %s: %s" % (h, (out.splitlines()[-1] if out else "done") if code == 0 else "route dns failed: " + out[-300:]))
     merge(cfg["update"], {"cloudflared_exe": exe, "cloudflared_config": path})
 
     restart = (raw.get("instance") or {}).get("tunnel_restart") or {}
@@ -624,6 +687,24 @@ def secrets_mod():
     return instance
 
 
+def step_usage(cfg, raw):
+    """Ask once (default: no) whether this instance may send anonymous usage statistics (usage.py)."""
+    u = raw.get("usage") or {}
+    if str(os.environ.get("DO_NOT_TRACK", "")).lower() in ("1", "true") or \
+            str(os.environ.get("CORIUM_NO_USAGE", "")).lower() in ("1", "true"):
+        return say("  usage statistics: off (DO_NOT_TRACK / CORIUM_NO_USAGE is set)")
+    say("  Help improve Corium by sending anonymous usage statistics? Once a day, only numbers: Corium and Python")
+    say("  version, OS family and CPU type, CPU threads / RAM in size buckets, CPU and memory load, which features are")
+    say("  on, file counts and sizes per type (image, video, ...), requests and bytes served. Rounded, under a random id.")
+    say("  Never: names, paths, domains, IP addresses, visitors, accounts, e-mail addresses, keys or settings.")
+    say("  Full list: docs/USAGE-STATISTICS.md. Preview or change it any time in Settings > System.")
+    on = yes("Send anonymous usage statistics?", default=bool(u.get("enabled")))
+    upd = {"enabled": on, "asked": True}
+    if on and not re.fullmatch(r"[0-9a-f]{32}", u.get("id") or ""):
+        upd.update(id=secrets.token_hex(16), key=secrets.token_urlsafe(32))
+    merge(cfg["update"], {"usage": upd})
+
+
 def step_save(cfg, raw, path):
     """strata.json without secrets (its backup too); every secret goes to <home>/data/.env, locked down."""
     inst = secrets_mod()
@@ -642,6 +723,18 @@ def step_save(cfg, raw, path):
         say("  wrote %d secret(s) to %s (this account, SYSTEM and Administrators only)" % (sum(1 for v in found.values() if v), env))
     write(path, json.dumps(merged, indent=2) + "\n")
     say("  wrote %s" % path)
+    # Corium Telemetry's port, offset like the others so a second instance doesn't collide with the first. Corium adds
+    # the feed address on its first start (feed.ensure_token) and keeps this; the feed token stays in data/.env.
+    tele_path, listen = telemetry_conf_path(cfg["_home"]), "127.0.0.1:%d" % cfg["ports"]["telemetry"]
+    if telemetry_listen(cfg["_home"]) != listen:
+        tele = {}
+        try:
+            with open(tele_path, encoding="utf-8-sig") as f:
+                tele = json.load(f)
+        except (OSError, ValueError):
+            pass
+        tele["listen"] = listen
+        write(tele_path, json.dumps(tele, indent=2) + "\n")
 
 
 def step_service(cfg, raw):
@@ -666,6 +759,42 @@ def step_service(cfg, raw):
         time.sleep(1)
     say("  Corium did not answer within 40 seconds. Its log: %s" % os.path.join(home, "data", "strata.log"))
     return False
+
+
+def step_stats_service(cfg, raw, service):
+    """Corium Telemetry, the public statistics page, as its own service - after Corium itself, whose first start
+    creates the feed token the page needs. Answered "no" this time: offer to remove a service registered earlier."""
+    home, stats = cfg["_home"], cfg["site"].get("stats")
+    name = service_names(home, raw["instance"]["id"])[2]
+    script = os.path.join(CODE, "telemetry", "telemetry.py")
+    if not service:
+        if stats:
+            say("And the statistics page, once Corium has started:  python \"%s\" --home \"%s\"" % (script, home))
+        return
+    if not stats:
+        if service_registered(name) and yes("The statistics page is off. Stop and remove its service \"%s\"?" % name):
+            code, out = remove_service(name)
+            say("  removed %s. Corium keeps the \"Public statistics\" drive: disable or delete it under Serving." % name
+                if code == 0 else "  could not remove %s: %s" % (name, out))
+        return
+    if WIN:
+        pyw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+        install_task(name, "Corium public statistics page for %s" % raw["instance"]["name"],
+                     pyw if os.path.exists(pyw) else sys.executable, '"%s" --home "%s"' % (script, home),
+                     os.path.dirname(script))
+    else:
+        install_unit(name, "Corium public statistics page for %s" % raw["instance"]["name"],
+                     '%s %s --home %s' % (sys.executable, script, home), os.path.dirname(script),
+                     "network-online.target %s.service" % service_names(home, raw["instance"]["id"])[0])
+    listen = telemetry_listen(home) or "127.0.0.1:%d" % cfg["ports"]["telemetry"]
+    for _ in range(20):
+        if http_get("http://%s/" % listen, timeout=3)[0] == 200:
+            say("  %s registered and started; the statistics page answers on http://%s" % (name, listen))
+            say("  Public address: https://%s (Cloudflare settings for it: telemetry/site/README.md)" % stats)
+            return
+        time.sleep(1)
+    say("  %s is registered but the page did not answer on http://%s within 20 seconds. To see why, run:\n"
+        "    python \"%s\" --home \"%s\"" % (name, listen, script, home))
 
 
 # ---------------------------------------------------------------- commands
@@ -695,22 +824,23 @@ def check(home):
     say("cloudflared %s" % (find_exe("cloudflared", raw.get("cloudflared_exe", "")) or "not found"))
     if raw:
         name = service_names(home, raw.get("instance", {}).get("id"))[0]
-        say("service     %s: %s" % (name, "registered" if (task_exists(name) if WIN else service_exists(name)) else "not registered"))
+        say("service     %s: %s" % (name, "registered" if service_registered(name) else "not registered"))
         say("dashboard   %s" % ("up" if http_get("http://%s/login" % raw.get("listen", "127.0.0.1:8090"), timeout=3)[0] == 200 else "down"))
+        stats = next((h for h in (raw.get("public") or {}).get("hosts") or [] if h.startswith("stats.")), "")
+        tname, listen = service_names(home, raw.get("instance", {}).get("id"))[2], telemetry_listen(home)
+        say("stats page  %s" % ("off (no stats.<domain> host)" if not stats else "%s, service %s: %s, page %s" % (
+            stats, tname, "registered" if service_registered(tname) else "not registered",
+            "up" if listen and http_get("http://%s/" % listen, timeout=3)[0] == 200 else "down")))
 
 
 def uninstall(home):
     _, raw = load(home)
-    name = service_names(home, raw.get("instance", {}).get("id"))[0]
-    if WIN:
-        run(["schtasks", "/End", "/TN", name])
-        code, out = run(["schtasks", "/Delete", "/TN", name, "/F"])
-    else:
-        run(["systemctl", "disable", "--now", name])
-        code, out = (0, "") if not os.path.exists("/etc/systemd/system/%s.service" % name) else run(
-            ["rm", "/etc/systemd/system/%s.service" % name])
-        run(["systemctl", "daemon-reload"])
-    say("removed %s" % name if code == 0 else "could not remove %s: %s" % (name, out))
+    names = service_names(home, raw.get("instance", {}).get("id"))
+    for name in (names[0], names[2]):
+        if name == names[2] and not service_registered(name):
+            continue
+        code, out = remove_service(name)
+        say("removed %s" % name if code == 0 else "could not remove %s: %s" % (name, out))
     say("Configuration and data in %s are untouched. Caddy and the tunnel keep running." % home)
 
 
@@ -757,15 +887,18 @@ def main():
     step(5, total, "Keys and owner account")
     step_tokens(cfg, raw)
     step(6, total, "Configuration")
+    step_usage(cfg, raw)
     step_save(cfg, raw, path)
     if a.no_service:
         step_caddy_running(cfg, False)
         say("\nDone. Start Corium with:  python strata.py --home \"%s\"" % home)
+        step_stats_service(cfg, raw, False)
         return
     step(7, total, "Service")
     step_caddy_running(cfg, True)
     ok = step_service(cfg, raw)
     if ok:
+        step_stats_service(cfg, raw, True)
         say("\nDone. Open http://%s on this machine%s." % (
             raw["listen"], "" if raw.get("auth", {}).get("password_hash") else " to create the owner account"))
 

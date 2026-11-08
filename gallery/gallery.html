@@ -122,7 +122,25 @@ body.fit .t img, body.fit .t video { object-fit: contain; }
   </div>
 </div>
 
-<script id="listing" type="application/json">{{toJson .Items}}</script>
+{{- /* The listing leaves out, here on the server, what the drive would not serve: dot-files and system clutter, and
+     whatever a hide or forbid rule covers (unless an allow rule lets it through). Caddy sets the three headers
+     (rules.py, listing_filter); a client can't. Caddy names folders "name/": they are checked with and without the
+     slash, as the access rules see both URLs. */ -}}
+{{- $path := .Req.Header.Get "X-Strata-Gallery-Path" -}}
+{{- $hide := .Req.Header.Get "X-Strata-Gallery-Hide" -}}
+{{- $allow := .Req.Header.Get "X-Strata-Gallery-Allow" -}}
+{{- $items := list -}}
+{{- range .Items -}}
+{{- $name := trimSuffix "/" .Name -}}
+{{- $p := print $path $name -}}
+{{- $d := print $p "/" -}}
+{{- $out := regexMatch `(?i)^(\.|\$|~\$)|^(thumbs\.db|desktop\.ini|system volume information)$` $name -}}
+{{- if and (not $out) $hide (or (regexMatch $hide $p) (and .IsDir (regexMatch $hide $d))) -}}
+{{- if not (and $allow (or (regexMatch $allow $p) (and .IsDir (regexMatch $allow $d)))) -}}{{- $out = true -}}{{- end -}}
+{{- end -}}
+{{- if not $out -}}{{- $items = append $items . -}}{{- end -}}
+{{- end }}
+<script id="listing" type="application/json">{{toJson $items}}</script>
 <script>
 (function () {
   'use strict';

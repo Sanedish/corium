@@ -1,5 +1,22 @@
 # Changelog
 
+11/08/2026 - From: (v0.5.0), To: (v0.5.1).
+
+## Security
+
+- **Gallery listings leave out hidden entries:** a gallery page carried the whole folder listing (names, sizes, dates) in its source. Dot-files were hidden only by the browser, and entries covered by the drive's hide or forbid rules were not left out at all. The listing is now filtered with the drive's hide, forbid and allow rules before it reaches the page, so left-out entries never leave the server. Folder link-preview cards use the same filter.
+- **Folder link previews:** a folder card only draws pictures that Corium Media's upload scan has let through. Held, pending or unanswered pictures are not drawn, and if Media's settings can't be read the card draws none.
+
+## Fixes
+
+- **Folder link previews reach the card:** a shared gallery folder link showed crawlers the listing page instead of the preview card, because the gallery route answered first. The card routes now run right before the galleries, after the access rules and the bot challenge, so hidden folders get no card and challenged ones the puzzle.
+
+## Corium
+
+- **Usage statistics (opt-in):** Corium can send anonymous usage statistics once a day: version, OS family and CPU type, machine size in buckets, CPU and memory load, which features are on, file counts and sizes per type, and the last 24 hours' requests and bytes, rounded and under a random id. It is off until the owner says yes: `setup.py` asks (default no), existing instances ask the owner once in the dashboard. Only the owner sees System › Usage statistics, with a preview of the exact report, Switch off, and Switch off and delete sent data. `DO_NOT_TRACK=1` or `CORIUM_NO_USAGE=1` keeps it off. Every field: [docs/USAGE-STATISTICS.md](docs/USAGE-STATISTICS.md).
+- **Public statistics page in the installer:** `setup.py` now asks whether to publish the statistics page (Corium Telemetry) at `stats.<domain>` (default no). Before, a new install had no way to turn it on short of editing `strata.json` before the first start and registering the service by hand. If you answer yes, setup adds the host, adds a tunnel rule and DNS record for it next to the CDN's, gives the page its own port (offset by 100 for a second instance, like the others) and registers it as a service ("Strata Telemetry") once Corium has started. Answering no on a later run offers to remove that service. A stats host added after the first start now gets its "Public statistics" drive once, on the next start. A drive you delete stays deleted. `--check` and `--uninstall` cover the page's service. Re-running setup no longer drops hostnames you added to `public.hosts` by hand.
+- **Usage statistics:** `public_stats_page` now reports whether a stats host is published. It used to report `true` on every instance that had started once.
+
 11/07/2026 - From: (v0.4.1), To: (v0.5.0).
 
 ## Corium

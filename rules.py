@@ -101,6 +101,8 @@ PHONE_UA = r"(?i)Mobi|iPhone|iPod|Android.+Mobile|Windows Phone|BlackBerry|Opera
 NAV_EXPR = ('{http.request.header.Sec-Fetch-Dest} in ["document", "iframe"] || ({http.request.header.Sec-Fetch-Dest} == ""'
             ' && {http.request.header.Accept}.contains("text/html"))')
 PLAYER_HEADERS = ("X-Strata-Player-Dir", "X-Strata-Player-Bg", "X-Strata-Player-Bg-Url")
+# set by Caddy for gallery/gallery.html: the folder's URL path, and what its listing must leave out (see listing_filter)
+GALLERY_HEADERS = ("X-Strata-Gallery-Path", "X-Strata-Gallery-Hide", "X-Strata-Gallery-Allow")
 PREVIEW_UA = "(?i)" + core.EMBED_RE.pattern  # link-preview crawlers (Discord, Slack, Telegram, X, WhatsApp...)
 # file types the platforms embed themselves (pictures, videos, web pages): every other file gets a Corium card
 PREVIEW_NATIVE = ("jpg", "jpeg", "png", "webp", "gif", "bmp", "tif", "tiff", "avif", "svg", "ico", "heic", "mp4",
@@ -675,6 +677,41 @@ def seed(db):
     return True
 
 
+def ensure_stats_mount(db):
+    """A stats.<zone> host added after the first run (setup.py, or strata.json by hand) gets the "Public statistics"
+    drive seed() would have made, and the quiet-log entry for the page's polling. Once per hostname: a drive the
+    owner deletes or changes later stays that way. Returns True when it created the drive."""
+    sh = stats_host()
+    if not sh or get_meta(db, "stats_mount") == sh:
+        return False
+
+    def hosts(v):
+        try:
+            h = json.loads(v or "[]")
+        except ValueError:
+            h = v
+        return h if isinstance(h, list) else [h]
+    have = any(sh in hosts(r[0]) for r in db.execute("SELECT hosts FROM mount"))
+    if not have:
+        tele = "127.0.0.1:8082"
+        try:
+            with open(os.path.join(core.HOME, "telemetry", "telemetry.json"), encoding="utf-8-sig") as f:
+                tele = json.load(f).get("listen") or tele
+        except (OSError, ValueError, AttributeError):
+            pass
+        t = now()
+        db.execute("INSERT INTO mount(name,kind,path,prefix,hosts,cache,edge_cache,precompress,browse,transforms,"
+                   "enabled,sort,note,created,updated) VALUES('Public statistics','proxy',?,'/',?,'','',0,0,0,1,20,"
+                   "'Corium Telemetry',?,?)", [tele, json.dumps([sh]), t, t])
+    s = get_meta(db, "site")
+    if s and not any((q or {}).get("host") == sh for q in s.get("quiet") or []):
+        s["quiet"] = list(s.get("quiet") or []) + [{"host": sh, "paths": ["/api/live", "/api/stats"]}]
+        set_meta(db, "site", s)
+    set_meta(db, "stats_mount", sh)
+    core.mounts(refresh=True)
+    return not have
+
+
 def upgrade_cache_policy(db):
     """One-time: drives still on the old default (immutable for a year, in browsers too) move to browser revalidation
     plus a year at Cloudflare. With `immutable`, a browser that has a file never asks again, so deleting it cannot
@@ -937,6 +974,51 @@ def gallery_patterns(pats):
     return list(dict.fromkeys(out))
 
 
+def caddy_path_rx(pat):
+    """An RE2 that matches what Caddy's `path` matcher matches for pat (MatchPath in Caddy 2.11): case-insensitive;
+    `*x*` is a substring, a single leading or trailing `*` a suffix or prefix, anything else path.Match, where `*` and
+    `?` stay inside one segment (a `[class]` is taken literally here). None for a `%` pattern, which Caddy compares in
+    the escaped path."""
+    p = pat.lower()
+    if "%" in p:
+        return None
+    if p == "*":
+        body = ".*"
+    elif p.count("*") == 2 and p.startswith("*") and p.endswith("*"):
+        body = re2_literal(p[1:-1])
+    elif p.count("*") == 1 and p.startswith("*"):
+        body = re2_literal(p[1:]) + "$"
+    elif p.count("*") == 1 and p.endswith("*"):
+        body = "^" + re2_literal(p[:-1])
+    else:
+        body = "^" + "".join("[^/]*" if c == "*" else "[^/]" if c == "?" else re2_literal(c) for c in p) + "$"
+    return "(?i:%s)" % body
+
+
+def rule_rx(pats):
+    """One RE2 for a rule's patterns, as path_conds() / exception_conds() turn them into matchers: a rule with a
+    `re:` pattern matches by its (first) regex alone, otherwise by any of its path patterns."""
+    rx = [p[3:] for p in pats if p.startswith("re:")]
+    if rx:
+        return "(?:%s)" % rx[0]
+    alts = [a for a in (caddy_path_rx(p) for p in pats) if a]
+    return "|".join(alts) if alts else None
+
+
+def listing_filter(rules, m):
+    """(hide, allow) for the gallery listing of drive m, as RE2s over a full URL path ('' = none): an entry that a
+    hide or forbid rule answers with 404 / 403 is left out of the listing, unless an allow rule lets it through. Caddy's
+    browse would otherwise name it, with size and date, in the page source (its `hide` list can't do this: a listing
+    compares hide paths against bare entry names). Rules for every drive only take the allows for every drive as
+    exceptions (as in the access rules), so with one of those present the drive's own allows are left out: the listing
+    then hides a little more, never less."""
+    mine = [r for r in rules if not r["mount"] or r["mount"] == m["id"]]
+    hides = [r for r in mine if r["action"] in ("hide", "deny")]
+    allows = [r for r in mine if r["action"] == "allow" and (not r["mount"] or all(h["mount"] for h in hides))]
+    join = lambda rs: "|".join(x for x in (rule_rx(r["patterns"]) for r in rs) if x)  # noqa: E731
+    return join(hides), join(allows) if hides else ""
+
+
 def render_galleries(o, rules, mounts):
     """Step 3b: `gallery` rules list matching *folders* with the gallery browse template. Only existing directories
     are taken (a nested file matcher, evaluated after the outer set has captured the drive-relative path); files,
@@ -961,14 +1043,21 @@ def render_galleries(o, rules, mounts):
             o.add(4, "try_files %s/" % ("{re.%s.1}" % n if pre else "{path}"))
             o.add(3, "}")
             o.add(3, "handle @%s_dir {" % n)
+            o.add(4, "route {")
+            # set by Caddy only, in this order: the path the access rules matched (before strip_prefix), and the
+            # rules gallery.html applies to the listing; whatever a client sent under these names is replaced
+            o.add(5, "request_header %s {http.request.uri.path}" % GALLERY_HEADERS[0])
+            for h, v in zip(GALLERY_HEADERS[1:], listing_filter(rules, m)):
+                o.add(5, "request_header %s %s" % (h, bq_text(v)) if v else "request_header -%s" % h)
             if pre:
-                o.add(4, "uri strip_prefix %s" % bq(pre))
-            o.add(4, "root * %s" % bq(m["path"]))
-            o.add(4, "header Cache-Control %s" % bq(GALLERY_CACHE))
-            o.add(4, "header -%s" % EDGE_HEADER)
-            o.add(4, "header -Last-Modified")  # Caddy's is the newest *remaining* file: a delete would 304
-            o.add(4, "file_server {")
-            o.add(5, "browse %s" % bq(GALLERY_TEMPLATE))
+                o.add(5, "uri strip_prefix %s" % bq(pre))
+            o.add(5, "root * %s" % bq(m["path"]))
+            o.add(5, "header Cache-Control %s" % bq(GALLERY_CACHE))
+            o.add(5, "header -%s" % EDGE_HEADER)
+            o.add(5, "header -Last-Modified")  # Caddy's is the newest *remaining* file: a delete would 304
+            o.add(5, "file_server {")
+            o.add(6, "browse %s" % bq(GALLERY_TEMPLATE))
+            o.add(5, "}")
             o.add(4, "}")
             o.add(3, "}")
             o.add(2, "}")
@@ -1045,41 +1134,76 @@ def render_players(o, rules, mounts):
             o.add(2, "}")
 
 
-def render_previews(o, mounts, rules):
-    """Step 4b: link previews. A crawler on the bare URL of a file gets Open Graph tags from Transform; ?card=1 is
-    the image they point at. After the access rules and the scan gate, so hidden, protected and held files never
-    get one. Pictures, videos and web pages keep the platforms' own embeds. Folders get a preview only inside a
-    gallery rule (anywhere else a folder URL is a 404, and a preview would list what people can't open).
-    Transform answers 404 for a file that isn't there, which becomes the normal 404 page."""
-    if not mounts:
-        return
-    o.add(2, "# link previews: Open Graph page for crawlers on the bare URL, ?card=1 is its image")
+def scan_gate(m):
+    """(media's /_scan URL, regex of the extensions it gates) when Corium Media's scan gate covers drive m, else ("", "").
+    A folder card asks the gate before drawing a picture, since a held or pending picture answers 403 / 503 when
+    opened. If media's settings can't be read, a regex that gates every name, so the card draws no pictures."""
+    if media_rules is None or m["kind"] != "files":
+        return "", ""
+    try:
+        if not media_rules.enabled():
+            return "", ""
+        g = media_rules._m().get("gate") or {}
+        rx = media_rules.gated_regex(g.get("categories")) if g.get("enabled") else None
+        return ("http://%s/_scan" % media_rules.listen(), rx) if rx else ("", "")
+    except Exception as e:
+        log("scan gate settings for folder cards: %s" % e)
+        return "http://127.0.0.1:1/_scan", "."
 
-    def proxy(n, mid, page, gallery):
-        o.add(2, "reverse_proxy @%s %s {" % (n, CFG["transform_listen"]))
-        o.add(3, "header_up X-Strata-Mount %d" % mid)
-        o.add(3, "header_up X-Strata-Embed 1" if page else "header_up -X-Strata-Embed")
-        o.add(3, "header_up X-Strata-Gallery 1" if gallery else "header_up -X-Strata-Gallery")
-        o.add(3, "@%s_missing status 404" % n)
-        o.add(3, "handle_response @%s_missing {" % n)
-        o.add(4, "error 404")
-        o.add(3, "}")
-        o.add(2, "}")
 
+def preview_proxy(o, n, m, page, gallery, rules):
+    """reverse_proxy @n to Transform for a link preview of drive m: the page (page=True) or its card image."""
+    o.add(2, "reverse_proxy @%s %s {" % (n, CFG["transform_listen"]))
+    o.add(3, "header_up X-Strata-Mount %d" % m["id"])
+    o.add(3, "header_up X-Strata-Embed 1" if page else "header_up -X-Strata-Embed")
+    o.add(3, "header_up X-Strata-Gallery 1" if gallery else "header_up -X-Strata-Gallery")
+    # a folder card draws the folder's pictures: what the gallery listing leaves out (listing_filter) stays out, and
+    # a picture the scan gate holds is not drawn. Set by Caddy only: whatever a client sent under these names is replaced
+    filt = listing_filter(rules, m) if gallery else ("", "")
+    gate = scan_gate(m) if gallery else ("", "")
+    for h, v in zip(GALLERY_HEADERS[1:] + ("X-Strata-Scan", "X-Strata-Scan-Ext"), filt + gate):
+        o.add(3, "header_up %s %s" % (h, bq_text(v)) if v else "header_up -%s" % h)
+    o.add(3, "@%s_missing status 404" % n)
+    o.add(3, "handle_response @%s_missing {" % n)
+    o.add(4, "error 404")
+    o.add(3, "}")
+    o.add(2, "}")
+
+
+def render_folder_cards(o, rules, mounts):
+    """Step 3a', right before the galleries (which would answer a crawler with the listing page): a link-preview
+    crawler on the bare URL of a gallery folder gets Open Graph tags from Transform, `?card=1` the folder's card. The
+    access rules and the bot challenge come first, so a hidden folder gets no card, and a challenged one the puzzle."""
     ua = "header_regexp %s User-Agent %s" % (o.name("pvua"), bq(PREVIEW_UA))
-    crawler = [ua, 'expression `{http.request.uri.query} == ""`']
     folder = '{http.request.uri.path}.matches("(/|/[^./]+)$")'  # a folder URL (with or without the slash)
+    first = True
     for r in [r for r in rules if r["action"] == "gallery"]:
         for m in mounts:
-            if r["mount"] and r["mount"] != m["id"]:
+            if m["kind"] != "files" or (r["mount"] and r["mount"] != m["id"]):
                 continue
+            if first:
+                o.add(2, "# gallery folder cards: Open Graph page for crawlers on the folder URL, ?card=1 is its image")
+                first = False
             for page in (True, False):
                 n = o.name("pvg%d" % r["id"])
                 # one expression per matcher: the folder test joins the query test instead of being a second line
                 extra = ([ua, 'expression `{http.request.uri.query} == "" && %s`' % folder] if page
                          else ["query card=1", "expression `%s`" % folder])
                 o.matcher(2, n, [host_cond(m["hosts"])] + path_conds(gallery_patterns(r["patterns"]), o, "pvg") + extra)
-                proxy(n, m["id"], page, True)
+                preview_proxy(o, n, m, page, True, rules)
+
+
+def render_previews(o, mounts, rules):
+    """Step 4b: link previews. A crawler on the bare URL of a file gets Open Graph tags from Transform; ?card=1 is
+    the image they point at. After the access rules and the scan gate, so hidden, protected and held files never
+    get one. Pictures, videos and web pages keep the platforms' own embeds. Folders get theirs earlier, only inside
+    a gallery rule (render_folder_cards; anywhere else a folder URL is a 404). Transform answers 404 for a file that
+    isn't there, which becomes the normal 404 page."""
+    if not mounts:
+        return
+    o.add(2, "# link previews: Open Graph page for crawlers on the bare URL, ?card=1 is its image")
+    ua = "header_regexp %s User-Agent %s" % (o.name("pvua"), bq(PREVIEW_UA))
+    crawler = [ua, 'expression `{http.request.uri.query} == ""`']
     for m in mounts:
         pc = [] if m["prefix"] == "/" else ["path " + bq(m["prefix"] + "/*")]
         for page in (True, False):
@@ -1087,7 +1211,7 @@ def render_previews(o, mounts, rules):
             conds = [host_cond(m["hosts"])] + pc + ["path_regexp %s %s" % (n, bq(r"\.[A-Za-z0-9]{1,10}$")),
                                                     "not path_regexp %s %s" % (o.name("pvn"), bq(PREVIEW_NATIVE_RX))]
             o.matcher(2, n, conds + (crawler if page else ["query card=1"]))
-            proxy(n, m["id"], page, False)
+            preview_proxy(o, n, m, page, False, rules)
 
 
 def challenge_pairs(rules, mounts):
@@ -1365,6 +1489,7 @@ def render(db):
                 o.add(2, "respond @%s `This link has expired.` 410" % n)
 
     render_challenge(o, rules, mounts, allows)
+    render_folder_cards(o, rules, mounts)
     render_galleries(o, rules, mounts)
     render_players(o, rules, mounts)
 

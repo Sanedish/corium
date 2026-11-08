@@ -89,6 +89,7 @@ SECRETS = {
     ("alerts", "smtp", "password"): "STRATA_SMTP_PASSWORD",
     ("alerts", "webhooks"): "STRATA_WEBHOOKS",           # the URLs carry their tokens (Discord, Slack, ntfy)
     ("media", "admin_token"): "STRATA_MEDIA_ADMIN_TOKEN",
+    ("usage", "key"): "STRATA_USAGE_KEY",                 # erases this instance's usage statistics at the collector
 }
 JSON_SECRETS = {("auth", "recovery"), ("auth", "api_keys"), ("alerts", "webhooks")}
 FEED_TOKEN = "STRATA_FEED_TOKEN"                          # the telemetry token itself (feed.py, telemetry.py)

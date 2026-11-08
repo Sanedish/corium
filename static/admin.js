@@ -40,8 +40,45 @@
           <p class="small dim">Database optimization runs SQLite ANALYZE and a WAL checkpoint. Keep a current backup before changing retention.</p></section>
         ${versionsPanel()}
         ${meOwner() ? backupPanel() : ''}
+        ${meOwner() ? usagePanel() : ''}
       </div></div>`;
   }
+  // Usage statistics (usage.py, docs/USAGE-STATISTICS.md): opt-in, owner only, the exact report is one click away
+  const USAGE_WHAT = 'Once a day, only numbers and fixed words: Corium and Python version, OS family and CPU type, CPU threads and RAM in size buckets, CPU and memory load, which features are on, file counts and sizes per type (image, video, …), requests and bytes served in the last 24 hours. Rounded, under a random id.';
+  const USAGE_NEVER = 'Never: file or folder names, paths, domains, IP addresses, visitors, accounts, e-mail addresses, keys or settings.';
+  async function loadUsage() {
+    try { A.usage = await get('/api/usage'); } catch (e) { A.usage = { error: e.message }; }
+    render(true);
+  }
+  function usagePanel() {
+    if (!A.usage) { loadUsage(); return `<section class="panel sys-panel"><div class="ph"><h5>${icon('chart-bar')} Usage statistics</h5></div>${loading('Reading…')}</section>`; }
+    const u = A.usage, last = u.last || {};
+    const state = u.error ? esc(u.error) : u.blocked_by ? `Off: ${esc(u.blocked_by)} is set on this machine.`
+      : u.active ? 'On. ' + (last.ts ? `Last report ${stamp(last.ts)}${last.ok ? '' : ' (not delivered' + (last.error ? ': ' + esc(last.error) : '') + ')'}.` : 'The first report goes out shortly.')
+      : u.enabled ? 'On, but no collector is configured.' : 'Off. Nothing is sent.';
+    return `<section class="panel sys-panel"><div class="ph"><h5>${icon('chart-bar')} Usage statistics</h5><span class="small dim">owner only · opt-in</span></div>
+      <p class="small">${state}</p>
+      <p class="small dim">${esc(USAGE_WHAT)} ${esc(USAGE_NEVER)} <a href="${esc(u.doc || '#')}" target="_blank" rel="noopener">Every field, and why</a>.</p>
+      ${u.id ? `<p class="small dim">Anonymous id <code>${esc(u.id)}</code>, sent to ${esc(u.endpoint || '—')}</p>` : ''}
+      <div class="admin-actions"><button class="btn btn-secondary" data-act="usagePreview">Preview report</button>
+        ${u.enabled ? '<button class="btn btn-secondary" data-act="usageSet" data-arg="disable">Switch off</button>'
+          : `<button class="btn btn-primary" data-act="usageSet" data-arg="enable" ${u.blocked_by ? 'disabled' : ''}>Send usage statistics</button>`}
+        ${u.id ? `<button class="btn btn-secondary danger" data-act="usageSet" data-arg="delete">${u.enabled ? 'Switch off and delete sent data' : 'Delete sent data'}</button>` : ''}</div></section>`;
+  }
+  async function usagePreview() {
+    let r;
+    try { r = await get('/api/usage/preview'); } catch (e) { return note('Couldn’t build the report: ' + e.message, { err: true }); }
+    openSheet('Usage statistics', 'This is the whole report', `<p class="small dim">Built from this instance just now and not sent. The deletion key is added when sending and never shown or stored by the collector in plain text.</p>
+      <pre class="mono small" style="max-height:60vh;overflow:auto;white-space:pre-wrap">${esc(JSON.stringify(r, null, 2))}</pre>`, '', true);
+  }
+  // asked once, on the owner's first visit after setup or an upgrade (setup.py asks new installs itself)
+  setInterval(() => {
+    if (!D.me?.usage_ask || A.usageAsked || $('#sheet') || hidden()) return;
+    A.usageAsked = true;
+    openSheet('Corium', 'Help improve Corium?', `<p>Corium can send anonymous usage statistics so its developers know how many instances run, on what, and how they are used. It stays off unless you say yes, and you can switch it off any time in System.</p>
+      <p class="small dim">${esc(USAGE_WHAT)}</p><p class="small dim">${esc(USAGE_NEVER)}</p>`,
+      `<button class="btn btn-primary" data-act="usageSet" data-arg="enable">Yes, send usage statistics</button><button class="btn btn-secondary" data-act="usageSet" data-arg="dismiss">No thanks</button><button class="btn btn-secondary" data-act="usagePreview">Preview report</button>`);
+  }, 2500);
   function backupPanel() {
     return `<section class="panel sys-panel"><div class="ph"><h5>${icon('archive')} Backup</h5><span class="small dim">owner only</span></div>
       <p class="small dim">Settings without keys or passwords, plus the database. The database holds password hashes, so keep the file private.</p>
@@ -442,6 +479,18 @@
   SETTINGS_PANELS.push(accountSettingsPanel);
 
   Object.assign(ACT, {
+    usagePreview,
+    async usageSet(action) {
+      if (action === 'delete' && !(await ask({ kicker: 'Usage statistics', title: 'Switch off and delete the sent data?', danger: true, ok: 'Delete',
+        text: 'Corium asks the collector to erase every report sent under this instance’s anonymous id, then forgets the id.' }))) return;
+      try {
+        A.usage = await post('/api/usage', { action });
+        if (D.me) D.me.usage_ask = false;
+        closeSheet();
+        note(A.usage.warning || { enable: 'Usage statistics on. Thank you!', disable: 'Usage statistics off', delete: 'Usage statistics off, sent data deleted', dismiss: 'Usage statistics stay off' }[action], A.usage.warning ? { err: true } : undefined);
+        render(true);
+      } catch (e) { note(e.message, { err: true }); }
+    },
     sysRefresh() { A.system = null; A.systemError = ''; loadSystem(); },
     async sysRetention() {
       try { A.system = await post('/api/settings/retention', { raw_retention_days: +$('#sys-raw-days').value, retention_days: +$('#sys-agg-days').value }); note('Retention settings saved'); render(true); }

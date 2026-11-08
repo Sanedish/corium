@@ -372,7 +372,14 @@ class Handler(BaseHTTPRequestHandler):
                 data, info = audiocard.card(path, st, cache_dir, ov)
             else:
                 where = urllib.parse.unquote(url_path.rstrip("/").rsplit("/", 1)[0] + "/")  # the folder it sits in
-                data, info = cards.card(path, st, cache_dir, st is None, where, ov)
+                keep = servable = None
+                if st is None:  # a folder card: leave out what the drive's hide / forbid rules cover, draw no held picture
+                    base = urllib.parse.unquote(url_path.rstrip("/")) + "/"
+                    keep = cards.rule_filter(base, self.headers.get("X-Strata-Gallery-Hide", ""),
+                                             self.headers.get("X-Strata-Gallery-Allow", ""))
+                    servable = cards.gate_filter(self.headers.get("X-Strata-Scan", ""), self.headers.get("X-Strata-Mount", ""),
+                                                 base, self.headers.get("X-Strata-Scan-Ext", ""))
+                data, info = cards.card(path, st, cache_dir, st is None, where, ov, keep, servable)
         except Exception as e:
             return self.plain(422, "could not draw the preview (%s)" % e.__class__.__name__)
         v = info["key"][:12]

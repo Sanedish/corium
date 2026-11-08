@@ -45,6 +45,7 @@ import instance
 import gate
 import mailtpl
 import media_bridge
+import usage
 import network
 import office
 import rollup
@@ -387,6 +388,7 @@ ROUTE_CAPS = {
     "/api/bots/install": "security.bots", "/api/bots/setup": "security.bots",  # the last two download from github.com
     "/api/bots/under-attack": "security.bots", "/api/bots/auto-downloads": "security.bots",
     "/api/backup": "system.backup", "/api/backup/restore": "system.backup",  # the whole database: owner only
+    "/api/usage": "system.usage", "/api/usage/preview": "system.usage",    # usage statistics consent: owner only
     # own account
     "/api/me": "account.self", "/api/instance": "account.self", "/api/prefs": "account.self", "/api/password": "account.self",
     "/api/privacy/accept": "account.self", "/api/audit": "account.self", "/api/audit/events": "account.self",
@@ -1083,6 +1085,8 @@ class Handler(BaseHTTPRequestHandler):
             "/api/me": lambda: self.me(user),
             "/api/instance": instance_info,
             "/api/branding": branding,  # not in ROUTE_CAPS: administrators only
+            "/api/usage": usage.status,
+            "/api/usage/preview": usage.build,  # exactly what would be sent: computed, nothing leaves the machine
             "/api/emails": lambda: self.emails_state(user),
             "/api/settings/signups": lambda: {"allowed": accounts.signups_allowed(), "locked_by_env": bool(__import__("os").environ.get("ALLOW_SIGNUPS") is not None or __import__("os").environ.get("STRATA_ALLOW_SIGNUPS") is not None)},
             "/api/accounts": lambda: self.accounts_list(user),
@@ -1159,6 +1163,8 @@ class Handler(BaseHTTPRequestHandler):
                 "recovery_left": len(a.get("recovery") or []) if acct.get("role") == "root" else 0,
                 "sessions": App.sessions.count(), "autoban": CFG["autoban"], "bots": bool(CFG["anubis"]["enabled"]), "upload": CFG["upload"],
                 "versions_keep": CFG.get("versions_keep"), "links": CFG["links"],
+                # the owner hasn't answered the usage statistics question yet (the dashboard asks once)
+                "usage_ask": acct.get("role") == "root" and not CFG["usage"].get("asked") and not usage.env_blocked(),
                 "smartsort": dict(CFG["smartsort"], home=smart_home(user))}
 
     def system(self):
@@ -2459,6 +2465,27 @@ class Handler(BaseHTTPRequestHandler):
             core.save_config({"links": lk})
             A("link-settings", json.dumps(lk))
             return self.me(user)
+        if path == "/api/usage":  # owner only (system.usage is ROOT_ONLY)
+            act = str(b.get("action") or "")
+            if act == "enable":
+                if usage.env_blocked():
+                    raise files.FileError(409, "%s is set on this machine, so usage statistics stay off" % usage.env_blocked())
+                usage.enable()
+                threading.Thread(target=usage.send, daemon=True).start()  # the first report goes out now
+            elif act in ("disable", "delete"):
+                res = usage.disable(delete=act == "delete")
+                if act == "delete" and res is not None and not res.get("ok"):
+                    A("usage-" + act, "", note="collector unreachable")
+                    st = usage.status()
+                    st["warning"] = ("Switched off, but the collector could not be reached to delete the data (%s). "
+                                     "Try “Delete sent data” again later." % ((res or {}).get("error") or "no answer"))
+                    return st
+            elif act == "dismiss":
+                usage.dismiss()
+            else:
+                raise files.FileError(400, "unknown action")
+            A("usage-" + act, "")
+            return usage.status()
         if path == "/api/settings/upload":
             up = {}
             if "chunk_mb" in b:
@@ -2769,6 +2796,10 @@ class Housekeeping(threading.Thread):
                 except Exception as e:
                     log("update check failed: %s" % e)
             try:
+                usage.send()  # opt-in only; a no-op until the owner said yes, at most once a day
+            except Exception as e:
+                log("usage statistics failed: %s" % e)
+            try:
                 rules.warm_previews()  # link-preview cards of popular files, drawn ahead of time (skipped when busy)
             except Exception:
                 log("preview warm-up error:\n" + traceback.format_exc())
@@ -2799,6 +2830,9 @@ def main():
         with db:
             if rules.seed(db):
                 log("serving: imported drives and rules from the old Caddyfile")
+            if rules.ensure_stats_mount(db):
+                log("serving: added the \"Public statistics\" drive for %s (Corium Telemetry)" % rules.stats_host())
+                rules.APPLY_SOON.set()
             if rules.upgrade_cache_policy(db):
                 rules.APPLY_SOON.set()
     finally:

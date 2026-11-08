@@ -30,6 +30,7 @@ VERSION = 2
 S = A.S
 _LOCK = threading.Semaphore(2)
 IMAGE_EXT = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".avif"}
+PICTURES, PICTURE_MAX = 8, 60 << 20  # a folder card draws up to 8 pictures, none over 60 MB
 ARCHIVE_EXT = {".zip": "ZIP", ".tar": "TAR", ".tgz": "TAR.GZ", ".tbz2": "TAR.BZ2", ".txz": "TAR.XZ", ".7z": "7-ZIP",
                ".rar": "RAR"}
 RISKY = {".exe": "Windows program", ".msi": "Windows installer", ".com": "Windows program", ".scr": "Screen saver program",
@@ -110,6 +111,56 @@ def listing(path):
                 continue
     files.sort(key=lambda f: f[0].lower())
     return files, sorted(dirs, key=str.lower)
+
+
+CLUTTER_RE = re.compile(r"(?i)^(\$|~\$)|^(thumbs\.db|desktop\.ini|system volume information)$")
+
+
+def rule_filter(base, hide, allow):
+    """keep(name, is_dir) for the entries of the folder at URL path base (ending in /): False for system clutter and
+    for what Caddy says the drive's hide / forbid rules cover (hide), unless an allow rule lets it through (allow) -
+    the same test gallery.html applies to the gallery listing. A filter that doesn't compile keeps nothing."""
+    try:
+        h = re.compile(hide) if hide else None
+        a = re.compile(allow) if allow else None
+    except re.error:
+        return lambda name, is_dir: False
+
+    def hit(rx, p, is_dir):
+        return rx is not None and bool(rx.search(p) or (is_dir and rx.search(p + "/")))
+
+    def keep(name, is_dir):
+        if CLUTTER_RE.search(name):
+            return False
+        p = base + name
+        return not (hit(h, p, is_dir) and not hit(a, p, is_dir))
+    return keep
+
+
+def gate_filter(url, mount, base, ext_rx):
+    """servable(name) for the pictures of the folder at URL path base: a picture whose extension Corium Media's scan
+    gate covers (ext_rx) is drawn only if the gate answers 200 for it - held (403), pending (503), an error or no
+    answer all mean no. url: media's /_scan; None when the gate is off."""
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+    try:
+        rx = re.compile(ext_rx) if ext_rx else None
+    except re.error:
+        return lambda name: False
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))  # loopback: never through a system proxy
+
+    def servable(name):
+        if not url or (rx is not None and not rx.search(name)):
+            return True
+        req = urllib.request.Request(url, headers={"X-Strata-Mount": str(mount),
+                                                   "X-Forwarded-Uri": urllib.parse.quote(base + name, safe="/")})
+        try:
+            with opener.open(req, timeout=5) as r:
+                return r.status == 200
+        except (urllib.error.URLError, OSError, ValueError):
+            return False
+    return servable
 
 
 TAR_SCAN_BYTES = 256 << 20
@@ -625,7 +676,7 @@ def justified(path, pics, w, h):
     from PIL import Image, ImageOps
     Image.MAX_IMAGE_PIXELS = 60_000_000
     ims = []
-    for name, _, _ in pics[:8]:
+    for name, _, _ in pics[:PICTURES]:
         try:
             im = Image.open(os.path.join(path, name))
             im.draft("RGB", (w // 2, h // 2))  # JPEG: decode at a fraction of the size, far less work for big photos
@@ -650,11 +701,12 @@ def justified(path, pics, w, h):
     return canvas
 
 
-def card_folder(path, st, where, info, files, dirs):
+def card_folder(path, st, where, info, files, dirs, pics=None):
     from PIL import Image
     name = info["name"]
     w, h = A.W * A.SS, A.H * A.SS
-    pics = [f for f in files if os.path.splitext(f[0])[1].lower() in IMAGE_EXT and f[1] < 60 << 20]
+    if pics is None:
+        pics = [f for f in files if os.path.splitext(f[0])[1].lower() in IMAGE_EXT and f[1] < PICTURE_MAX]
     photo = justified(path, pics, w, h)
     total = sum(f[1] for f in files)
     if photo is None:
@@ -763,12 +815,12 @@ def card_file(path, st, where, info):
     return img
 
 
-def draw(kind, path, st, files=None, dirs=None, where="", ov=None):
-    """-> (jpeg bytes, info) for one card."""
+def draw(kind, path, st, files=None, dirs=None, where="", ov=None, pics=None):
+    """-> (jpeg bytes, info) for one card. pics: the pictures a folder card draws (card() picks them)."""
     name = os.path.basename(path.rstrip("/\\")) or "/"
     info = {"kind": kind, "title": name, "name": name, "ov": ov or {}}
     if kind == "folder":
-        img = card_folder(path, st, where, info, files, dirs)
+        img = card_folder(path, st, where, info, files, dirs, pics)
     else:
         img = {"archive": card_archive, "pdf": card_pdf, "text": card_text, "warning": card_warning}.get(kind, card_file)(
             path, st, where, info)
@@ -781,18 +833,27 @@ def draw(kind, path, st, files=None, dirs=None, where="", ov=None):
     return A.finish(img), info
 
 
-def card(path, st, cache_dir, is_dir=False, where="", ov=None):
+def card(path, st, cache_dir, is_dir=False, where="", ov=None, keep=None, servable=None):
     """(jpeg bytes, info), drawn once per file version - for a folder, once per listing. where: the URL path of the
     folder the file (or folder) sits in, shown on some cards. ov: link-preview rule settings (title, description,
-    color, kind)."""
+    color, kind). keep(name, is_dir): which folder entries the card may show (rule_filter). servable(name): whether
+    a picture may be drawn (the scan gate, gate_filter); asked before the cache, so its answer is part of the key."""
     ov = {k: v for k, v in (ov or {}).items() if k in ("title", "description", "color", "kind")}
     kind = kind_of(path, is_dir)
     if ov.get("kind") and (ov["kind"] == "folder") == is_dir and ov["kind"] != "audio":
         kind = ov["kind"]
-    files = dirs = None
+    files = dirs = pics = None
     if is_dir:
         files, dirs = listing(path)
-        ident = [path, files, dirs, where]
+        if keep:
+            files, dirs = [f for f in files if keep(f[0], False)], [d for d in dirs if keep(d, True)]
+        pics = []
+        for f in files:  # the pictures the card draws: the first PICTURES that may be shown
+            if os.path.splitext(f[0])[1].lower() in IMAGE_EXT and f[1] < PICTURE_MAX and (servable is None or servable(f[0])):
+                pics.append(f)
+                if len(pics) == PICTURES:
+                    break
+        ident = [path, files, dirs, where, [p[0] for p in pics]]
     else:
         ident = [path, st.st_size, st.st_mtime, where]
     k = hashlib.sha1(json.dumps(ident + [VERSION, A.VERSION, ov], sort_keys=True).encode()).hexdigest()
@@ -807,7 +868,7 @@ def card(path, st, cache_dir, is_dir=False, where="", ov=None):
         except (OSError, ValueError):
             pass
     with _LOCK:
-        data, info = draw(kind, path, st, files, dirs, where, ov)
+        data, info = draw(kind, path, st, files, dirs, where, ov, pics)
         info["key"] = k
         os.makedirs(cdir, exist_ok=True)
         for p, blob in ((cp, data), (jp, json.dumps(info).encode("utf-8"))):
