@@ -195,12 +195,14 @@ class StorageTests(unittest.TestCase):
 
 class IdentityTests(unittest.TestCase):
     def test_installer_detects_vulnerable_pillow_versions(self):
-        versions = {"brotli": "1.2.0", "zstandard": "0.25.0", "Pillow": "11.0.0", "qrcode": "8.2"}
+        versions = {"brotli": "1.2.1", "zstandard": "0.25.0", "Pillow": "11.0.0", "qrcode": "8.2"}
         with mock.patch("importlib.util.find_spec", return_value=True), mock.patch("importlib.metadata.version", side_effect=versions.get):
-            self.assertEqual(setup.package_problems(), ["Pillow 11.0.0 (need >=12.3.0)"])
-            versions["Pillow"] = "12.3.0.dev0"
+            self.assertEqual(setup.package_problems(), ["Pillow 11.0.0 (need >=13.0.0)"])
+            versions["Pillow"] = "12.3.0"  # 42 advisories fixed in 13.0.0
+            self.assertEqual(setup.package_problems(), ["Pillow 12.3.0 (need >=13.0.0)"])
+            versions["Pillow"] = "13.0.0.dev0"
             self.assertEqual(len(setup.package_problems()), 1)
-            versions["Pillow"] = "12.3.0"
+            versions["Pillow"] = "13.0.0"
             self.assertEqual(setup.package_problems(), [])
 
     def test_session_revocation_is_case_insensitive(self):

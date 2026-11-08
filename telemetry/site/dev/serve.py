@@ -25,7 +25,8 @@ def load_headers():
     for node in ast.parse(src).body:
         if isinstance(node, ast.Assign) and any(getattr(t, "id", "") == "SECURITY_HEADERS" for t in node.targets):
             headers = ast.literal_eval(node.value)
-    assert headers and "Content-Security-Policy" in headers, "SECURITY_HEADERS not found in telemetry.py"
+    if not headers or "Content-Security-Policy" not in headers:  # not assert: python -O would serve without a CSP
+        raise SystemExit("SECURITY_HEADERS not found in telemetry.py")
     headers.pop("Strict-Transport-Security", None)
     headers["Content-Security-Policy"] = headers["Content-Security-Policy"].replace("upgrade-insecure-requests; ", "")
     return headers

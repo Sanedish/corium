@@ -120,7 +120,8 @@ if __name__ == "__main__":  # self-check of the secret filter
                "alerts": {"resend_api_key": "re", "to": ["a@b.c"], "webhooks": ["https://x"]},
                "cloudflare": {"api_token": "t", "zone_name": "z"}, "feed_token_hash": "h", "sign_secret": "s",
                "media": {"admin_token": "m", "enabled": True}, "instance": {"token_env": "CF_API_TOKEN"}})
-    assert c == {"auth": {"user": "a", "session_hours": 1}, "alerts": {"to": ["a@b.c"]},
-                 "cloudflare": {"zone_name": "z"}, "media": {"enabled": True},
-                 "instance": {"token_env": "CF_API_TOKEN"}}, c
+    want = {"auth": {"user": "a", "session_hours": 1}, "alerts": {"to": ["a@b.c"]},
+            "cloudflare": {"zone_name": "z"}, "media": {"enabled": True}, "instance": {"token_env": "CF_API_TOKEN"}}
+    if c != want:  # not assert: python -O would skip the check and print "ok" for a leaking filter
+        raise SystemExit("secret filter left: %r" % c)
     print("ok")

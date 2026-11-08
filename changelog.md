@@ -1,5 +1,13 @@
 # Changelog
 
+Unreleased.
+
+## Security
+
+- **Pillow 13.0.0 required:** Pillow 12.3.0 is affected by 42 published advisories (6 critical, among them heap buffer overflows in JPEG, FlashPix and TIFF handling), all fixed in 13.0.0. `requirements.txt` now asks for `Pillow>=13.0.0`, and `setup.py` reports an older vendored Pillow and offers to update it. After updating: re-run `python setup.py` (or `pip install --target vendor -r requirements.txt` with Corium's Python), then restart Corium and its Transform and Media services.
+- **brotli 1.2.1 required:** brotli 1.2.0's decoder has an out-of-bounds write (CVE-2026-111497), fixed in 1.2.1. `requirements.txt` now asks for `brotli>=1.2.1`; the same `setup.py` check and update apply.
+- **Self-checks no longer use `assert`:** the backup secret-filter self-check and the telemetry dev server's security-header check raise an error instead, so running Python with `-O` can't skip them.
+
 11/08/2026 - From: (v0.5.0), To: (v0.5.1).
 
 ## Security
