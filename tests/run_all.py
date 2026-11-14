@@ -218,6 +218,7 @@ def main():
             ("usage statistics", py + [os.path.join(TESTS, "usage_test.py")]),
             ("public statistics page", py + [os.path.join(TESTS, "stats_page_test.py")]),
             ("caddy config", py + [os.path.join(TESTS, "caddy_test.py"), db]),
+            ("stacked drives", py + [os.path.join(TESTS, "stacked_test.py")]),
             ("bot protection", py + [os.path.join(TESTS, "anubis_test.py")]),
             ("gallery listings", py + [os.path.join(TESTS, "gallery_listing_test.py")]),
             ("permissions", py + [os.path.join(TESTS, "granular_regress.py"), db, files]),

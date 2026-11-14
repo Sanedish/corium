@@ -8,6 +8,10 @@ Unreleased.
 - **brotli 1.2.1 required:** brotli 1.2.0's decoder has an out-of-bounds write (CVE-2026-111497), fixed in 1.2.1. `requirements.txt` now asks for `brotli>=1.2.1`; the same `setup.py` check and update apply.
 - **Self-checks no longer use `assert`:** the backup secret-filter self-check and the telemetry dev server's security-header check raise an error instead, so running Python with `-O` can't skip them.
 
+## Fixes
+
+- **Stacked drives:** two folder drives on the same address (a hostname in common, and the same URL prefix, or one under the other's) used to leave the later drive unreachable: the first one answered every URL with its own file or a 404, so whatever only the second drive had (its files, their `?w=` variants and link previews) was never served, whatever the access rules said. Now the first drive in drive order that has the path answers, and the last one answers for what none of them has. Caddy checks this once per request, after the access rules and short links, and the bot challenge, galleries, link modifiers, Corium Media, the scan gate and link previews follow the drive it picked. The URL tester shows which drive answers and which drives share the address. Drives that don't share an address get exactly the config they had (`tests/stacked_test.py`).
+
 11/08/2026 - From: (v0.5.0), To: (v0.5.1).
 
 ## Security

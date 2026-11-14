@@ -834,6 +834,102 @@ def host_cond(hosts):
     return "host " + " ".join(bq(h) for h in hosts)
 
 
+# ---------------------------------------------------------------- stacked drives
+
+# Several folder drives may answer the same URLs (a hostname in common, and one prefix at or above the other's):
+# they are stacked. The first one in drive order that has the path answers; what none of them has goes to the last
+# one, which answers 404. Caddy decides it once per request (render_stacks) and notes the drive in this variable;
+# every per-drive step of a stacked drive then asks for it (stack_cond). Drives that share nothing get neither.
+# Before this, the first drive answered everything and the drives under it were unreachable.
+DRIVE_VAR = "strata_drive"
+
+
+def drive_order(mounts):
+    """The order drives answer in: the homepage, folder drives, services; inside a type the longest prefix first."""
+    return sorted(mounts, key=lambda m: ({"page": 0, "files": 1, "proxy": 2}[m["kind"]], -len(m["prefix"]), m["sort"]))
+
+
+def stack_plan(mounts):
+    """[(drive, hostnames on which a later drive is stacked under it, its other hostnames)] in drive order, for the
+    folder drives that are part of a stack. Empty for a set-up without stacks, whose config stays as it was."""
+    fm = [m for m in drive_order(mounts) if m["kind"] == "files"]
+
+    def hosts(m):
+        return {h.lower() for h in m["hosts"]}
+
+    def under(a, b):  # b's prefix is a's own or above it: b answers a's URLs too
+        pa, pb = a["prefix"].lower(), b["prefix"].lower()
+        return pb == "/" or pa == pb or pa.startswith(pb + "/")
+    plan = []
+    for i, m in enumerate(fm):
+        below = [h for h in m["hosts"] if any(h.lower() in hosts(x) and under(m, x) for x in fm[i + 1:])]
+        if below or any(hosts(m) & hosts(x) and under(x, m) for x in fm[:i]):
+            plan.append((m, below, [h for h in m["hosts"] if h not in below]))
+    return plan
+
+
+def stack_cond(m):
+    """The extra matcher line of a stacked drive's steps: Caddy picked this drive for the request."""
+    return ["vars %s d%d" % (DRIVE_VAR, m["id"])] if m.get("_stacked") else []
+
+
+def render_stacks(o, plan):
+    """Step 3, right after the access rules and short links: pick the drive for a request that stacked drives share.
+    Written from the last drive to the first: a drive takes the request when the path exists on it (a file, or a
+    folder) and, on hostnames where nothing is
+    stacked under it, in any case - so the first drive that has the path ends up with it, and the last one with
+    what none has. Each line only ever overwrites the pick: Caddy merges neighbouring routes whose matchers are
+    the same into one, so a line must not depend on a matcher seeing what the line before it set.
+    Runs after the access rules, so a hidden or denied path is never looked up."""
+    if not plan:
+        return
+    o.add(2, "# stacked drives (folder drives that answer the same URLs): the first one that has the path answers")
+    for m, below, rest in reversed(plan):
+        pre = "" if m["prefix"] == "/" else m["prefix"]
+        pick = "%s d%d" % (DRIVE_VAR, m["id"])
+        for hs, check in ((rest, False), (below, True)):
+            if not hs:
+                continue
+            n = o.name("st%d" % m["id"])
+            has = ["file {", "\troot %s" % bq(m["path"]), "\ttry_files %s", "}"]
+            if not pre:
+                o.matcher(2, n, [host_cond(hs)] + ([has[0], has[1], has[2] % "{path} {path}/", has[3]] if check else []))
+                o.add(2, "vars @%s %s" % (n, pick))
+                continue
+            # the drive's own URL space, and its drive-relative path as {re.<n>.1}
+            o.matcher(2, n, [host_cond(hs), "vars_regexp %s {path} %s" % (n, bq("(?i)^%s(/.*)?$" % re2_literal(pre)))])
+            if not check:
+                o.add(2, "vars @%s %s" % (n, pick))
+                continue
+            rel = "{re.%s.1}" % n
+            o.add(2, "route @%s {" % n)  # nested: the file matcher runs after the outer set captured the path
+            o.add(3, "@%s_has {" % n)
+            for line in (has[0], has[1], has[2] % ("%s %s/" % (rel, rel)), has[3]):
+                o.add(4, line)
+            o.add(3, "}")
+            o.add(3, "vars @%s_has %s" % (n, pick))
+            o.add(2, "}")
+
+
+def drive_file(m, path):
+    """Where URL path `path` is inside folder drive m - None for a path that would leave the drive."""
+    rel = path if m["prefix"] == "/" else path[len(m["prefix"]):] or "/"
+    parts = [p for p in rel.split("/") if p]
+    if any(p in (".", "..") or "\\" in p or ":" in p for p in parts):
+        return None
+    return os.path.normpath(os.path.join(m["path"], *parts))
+
+
+def stack_pick(drives, path):
+    """Which of the folder drives answering `path` (already in drive order) serves it, as Caddy decides it: the first
+    one that has the path, else the last one. A single drive is never looked at on disk."""
+    for m in drives[:-1]:
+        full = drive_file(m, path)
+        if full and os.path.exists(full):
+            return m
+    return drives[-1] if drives else None
+
+
 def path_conds(pats, out, prefix="p"):
     rx = [p[3:] for p in pats if p.startswith("re:")]
     if rx:
@@ -1189,6 +1285,8 @@ def render_folder_cards(o, rules, mounts):
                 # one expression per matcher: the folder test joins the query test instead of being a second line
                 extra = ([ua, 'expression `{http.request.uri.query} == "" && %s`' % folder] if page
                          else ["query card=1", "expression `%s`" % folder])
+                if not r["mount"]:  # a rule for every drive: on stacked drives, the one that has the folder
+                    extra = extra + stack_cond(m)
                 o.matcher(2, n, [host_cond(m["hosts"])] + path_conds(gallery_patterns(r["patterns"]), o, "pvg") + extra)
                 preview_proxy(o, n, m, page, True, rules)
 
@@ -1205,7 +1303,7 @@ def render_previews(o, mounts, rules):
     ua = "header_regexp %s User-Agent %s" % (o.name("pvua"), bq(PREVIEW_UA))
     crawler = [ua, 'expression `{http.request.uri.query} == ""`']
     for m in mounts:
-        pc = [] if m["prefix"] == "/" else ["path " + bq(m["prefix"] + "/*")]
+        pc = ([] if m["prefix"] == "/" else ["path " + bq(m["prefix"] + "/*")]) + stack_cond(m)
         for page in (True, False):
             n = o.name("pv%s%d" % ("p" if page else "c", m["id"]))
             conds = [host_cond(m["hosts"])] + pc + ["path_regexp %s %s" % (n, bq(r"\.[A-Za-z0-9]{1,10}$")),
@@ -1488,6 +1586,12 @@ def render(db):
             else:
                 o.add(2, "respond @%s `This link has expired.` 410" % n)
 
+    # 3 stacked drives: which one answers - every per-drive step from here on follows it
+    plan = stack_plan(mounts)
+    for m, _, _ in plan:
+        m["_stacked"] = True
+    render_stacks(o, plan)
+
     render_challenge(o, rules, mounts, allows)
     render_folder_cards(o, rules, mounts)
     render_galleries(o, rules, mounts)
@@ -1500,7 +1604,7 @@ def render(db):
     if fmounts:
         o.add(2, "# link modifiers: ?dl=1  ?w= ?h= ?fit= ?fm= ?q=  ?ver=")
     for m in fmounts:
-        pc = [] if m["prefix"] == "/" else ["path " + bq(m["prefix"] + "/*")]
+        pc = ([] if m["prefix"] == "/" else ["path " + bq(m["prefix"] + "/*")]) + stack_cond(m)
         n = o.name("dl%d" % m["id"])
         o.matcher(2, n, [host_cond(m["hosts"])] + pc + ["query dl=1"])
         o.add(2, "header @%s >Content-Disposition `attachment; filename=\"{http.request.uri.path.file}\"`" % n)
@@ -1534,8 +1638,7 @@ def render(db):
 
     # 5 drives
     o.add(2, "# drives")
-    order = sorted(mounts, key=lambda m: ({"page": 0, "files": 1, "proxy": 2}[m["kind"]], -len(m["prefix"]), m["sort"]))
-    for m in order:
+    for m in drive_order(mounts):
         if m["kind"] == "proxy" and m["prefix"] != "/":
             continue  # rendered in 2b
         n = o.name("m%d" % m["id"])
@@ -1543,9 +1646,9 @@ def render(db):
         if m["kind"] == "page":
             o.matcher(2, n, [host_cond(m["hosts"]), "path /"])
         elif m["kind"] == "files" and m["prefix"] != "/":
-            o.matcher(2, n, [host_cond(m["hosts"]), "path " + bq(m["prefix"]) + " " + bq(m["prefix"] + "/*")])
+            o.matcher(2, n, [host_cond(m["hosts"]), "path " + bq(m["prefix"]) + " " + bq(m["prefix"] + "/*")] + stack_cond(m))
         else:
-            o.matcher(2, n, [host_cond(m["hosts"])])
+            o.matcher(2, n, [host_cond(m["hosts"])] + stack_cond(m))
         if m["kind"] == "proxy":
             render_service(o, m, n, 2)
             continue
@@ -1760,8 +1863,8 @@ def warm_previews(limit=30):
     for host, path, _ in rows:
         if done >= limit or not path or path.endswith("/") or not re.search(r"\.[A-Za-z0-9]{1,10}$", path) or native.search(path):
             continue
-        m = next((m for m in sorted(mounts, key=lambda x: -len(x["prefix"])) if (host or "").lower() in [h.lower() for h in m["hosts"]]
-                  and (m["prefix"] == "/" or path == m["prefix"] or path.startswith(m["prefix"] + "/"))), None)
+        m = stack_pick([m for m in drive_order(mounts) if (host or "").lower() in [h.lower() for h in m["hosts"]]
+                        and (m["prefix"] == "/" or path == m["prefix"] or path.startswith(m["prefix"] + "/"))], path)
         if not m:
             continue
         req = urllib.request.Request("http://%s%s?card=1" % (CFG["transform_listen"], urllib.parse.quote(path)),
@@ -2927,13 +3030,18 @@ def test_url(url, ip="", ua="", country="", referer=""):
     m_hit = None
     lpath = path.lower()
     services = [m for m in mounts if m["kind"] == "proxy" and m["prefix"] != "/"]  # 2b: before every other drive
-    for m in sorted(services, key=lambda m: -len(m["prefix"])) + sorted(
-            [m for m in mounts if m not in services], key=lambda m: ({"page": 0, "files": 1, "proxy": 2}[m["kind"]], -len(m["prefix"]))):
+    hits = []
+    for m in sorted(services, key=lambda m: -len(m["prefix"])) + drive_order([m for m in mounts if m not in services]):
         pre = m["prefix"].lower()
         if host in m["hosts"] and (m["kind"] != "page" or path == "/") and (
                 m["kind"] == "page" or pre == "/" or lpath == pre or lpath.startswith(pre + "/")):
-            m_hit = m
-            break
+            hits.append(m)
+    stack = []
+    if hits:
+        m_hit = hits[0]
+        if m_hit["kind"] == "files":  # stacked folder drives: the first one that has the path, else the last one
+            stack = [m for m in hits if m["kind"] == "files"]
+            m_hit = stack_pick(stack, path)
     gallery = player = None
     for r in rules:
         if r["action"] == "allow":
@@ -3017,6 +3125,9 @@ def test_url(url, ip="", ua="", country="", referer=""):
     rel = path if m_hit["prefix"] == "/" else path[len(m_hit["prefix"]):] or "/"
     full = os.path.normpath(os.path.join(m_hit["path"], *[p for p in rel.split("/") if p]))
     steps.append("Drive “%s” → %s" % (m_hit["name"], full))
+    if len(stack) > 1:
+        steps.append("→ %s share this address: the first one that has the path answers, the last one otherwise"
+                     % ", ".join("“%s”" % m["name"] for m in stack))
     if gallery and m_hit["kind"] == "files" and os.path.isdir(full):
         steps.append("Rule “%s” (%s) matches this folder" % (gallery["name"], ACTIONS["gallery"]))
         return {"result": "200 OK (gallery view)" if path.endswith("/") else "308 → %s/ (then gallery view)" % path,

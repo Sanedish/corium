@@ -18,6 +18,9 @@ The suites, in the order run_all.py runs them:
   stats_page_test.py    the public statistics page: setup.py's question, hosts, tunnel rules, service names and port;
                         the "Public statistics" drive for a stats host added after the first run; the usage flag
   caddy_test.py         the generated Caddy config through a real `caddy validate` (skipped without Caddy)
+  stacked_test.py       folder drives on the same address: the first one that has the path answers, the last one
+                        the rest; the config, the URL tester, then real requests through a real Caddy (skipped
+                        without Caddy)
   anubis_test.py        bot protection: config off/on, policy and key files, settings checks, the download (fake archives),
                         then real requests through a real Caddy and a stub Anubis (skipped without Caddy); with STRATA_ANUBIS set (or anubis on the PATH)
                         the same requests run again against the real Anubis, puzzle solved

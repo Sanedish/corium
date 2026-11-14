@@ -193,7 +193,7 @@ def _policy_blocks(mounts):
     keeps its paths). Page mounts only ever serve "/" (always safe), so they need no policy."""
     import rules
     fm = [m for m in mounts if m["kind"] == "files" and m.get("enabled", 1)]
-    fm.sort(key=lambda m: (-len(m["prefix"]), m.get("sort") or 0, m["id"]))  # drive order: the first one serves
+    fm.sort(key=lambda m: (-len(m["prefix"]), m.get("sort") or 0, m["id"]))  # drive order (rules.drive_order)
     per_host = {}
     for m in fm:
         for h in m["hosts"]:
@@ -335,7 +335,7 @@ def render_media_routes(o, m, up, db=None, negotiation=None):
     if not m.get("transforms"):
         return False
     mode = negotiation or effective_negotiation(db)
-    pc = [] if m["prefix"] == "/" else ["path " + rules.bq(m["prefix"] + "/*")]
+    pc = ([] if m["prefix"] == "/" else ["path " + rules.bq(m["prefix"] + "/*")]) + rules.stack_cond(m)
     neg_rx = rules.bq("(?i)\\.(%s)$" % NEG_IMG_RX)
     if mode in ("redirect", "edge"):
         n = o.name("neg%d" % m["id"])
@@ -386,7 +386,7 @@ def render_gate(o, fmounts):
     o.add(2, "# scan gate + large-file lane (Corium Media)")
     for m in fm:
         hc = rules.host_cond(m["hosts"])
-        pc = [] if m["prefix"] == "/" else ["path " + rules.bq(m["prefix"] + "/*")]
+        pc = ([] if m["prefix"] == "/" else ["path " + rules.bq(m["prefix"] + "/*")]) + rules.stack_cond(m)
         n = o.name("gate%d" % m["id"])
         o.matcher(2, n, [hc] + pc + ["path_regexp %s %s" % (n, rules.bq(rx))])
         o.add(2, "forward_auth @%s %s {" % (n, listen()))
