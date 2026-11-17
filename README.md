@@ -9,6 +9,7 @@ Corium is a self-hosted control plane for a [Caddy](https://caddyserver.com) fil
 [Try a Demo](#try-a-demo) · [What it does](#what-it-does) · [Install](#install) · [How it works](#how-it-works) · [Configuration](#configuration) · [Platform support](#platform-support) · [Development](#development) · [Security](SECURITY.md) · [Discord](https://discord.gg/jRn5kbv2HX)
 
 > Corium was called **Strata** until v0.5.0. File names, `STRATA_*` variables, and scheduled task names on disk still use `Strata` so existing installs upgrade in place. See [docs/RENAMING.md](docs/RENAMING.md) for the full list.
+> I'm currently reworking a majority of the code in the hopes of delivering a cleaner and more powerful codebase. While I'm making good progress, it still takes a lot of time, so you will likely not see a new major release before 2027. 
 
 ---
 
